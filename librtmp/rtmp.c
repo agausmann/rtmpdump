@@ -867,9 +867,11 @@ int RTMP_SetupURL(RTMP *r, char *url)
 }
 
 static int
-add_addr_info(struct sockaddr_in *service, AVal *host, int port)
+add_addr_info(struct sockaddr_storage *service, AVal *host, int port, const struct addrinfo *hints)
 {
   char *hostname;
+  struct addrinfo *addr_info = NULL;
+  int gai_result;
   int ret = TRUE;
   if (host->av_val[host->av_len])
     {
@@ -882,21 +884,32 @@ add_addr_info(struct sockaddr_in *service, AVal *host, int port)
       hostname = host->av_val;
     }
 
-  service->sin_addr.s_addr = inet_addr(hostname);
-  if (service->sin_addr.s_addr == INADDR_NONE)
+  gai_result = getaddrinfo(hostname, NULL, hints, &addr_info);
+  if (gai_result)
     {
-      struct hostent *host = gethostbyname(hostname);
-      if (host == NULL || host->h_addr == NULL)
-	{
-	  RTMP_Log(RTMP_LOGERROR, "Problem accessing the DNS. (addr: %s)", hostname);
-	  ret = FALSE;
-	  goto finish;
-	}
-      service->sin_addr = *(struct in_addr *)host->h_addr;
+      RTMP_Log(RTMP_LOGERROR, "Address lookup failed. (addr: %s) %d (%s)",
+        hostname, gai_result, gai_strerror(gai_result));
+      ret = FALSE;
+      goto finish;
     }
+  memcpy(service, addr_info->ai_addr, addr_info->ai_addrlen);
 
-  service->sin_port = htons(port);
+  switch (service->ss_family)
+    {
+    case AF_INET:
+      ((struct sockaddr_in *)service)->sin_port = htons(port);
+      break;
+    case AF_INET6:
+      ((struct sockaddr_in6 *)service)->sin6_port = htons(port);
+      break;
+    default:
+      RTMP_Log(RTMP_LOGERROR, "Unsupported address family.");
+      ret = FALSE;
+      goto finish;
+    }
 finish:
+  if (addr_info)
+    freeaddrinfo(addr_info);
   if (hostname != host->av_val)
     free(hostname);
   return ret;
@@ -905,15 +918,26 @@ finish:
 int
 RTMP_Connect0(RTMP *r, struct sockaddr * service)
 {
+  socklen_t addrlen = sizeof(struct sockaddr);
+  switch (service->sa_family)
+    {
+    case AF_INET:
+      addrlen = sizeof(struct sockaddr_in);
+      break;
+    case AF_INET6:
+      addrlen = sizeof(struct sockaddr_in6);
+      break;
+    }
+
   int on = 1;
   r->m_sb.sb_timedout = FALSE;
   r->m_pausing = 0;
   r->m_fDuration = 0.0;
 
-  r->m_sb.sb_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  r->m_sb.sb_socket = socket(service->sa_family, SOCK_STREAM, IPPROTO_TCP);
   if (r->m_sb.sb_socket != -1)
     {
-      if (connect(r->m_sb.sb_socket, service, sizeof(struct sockaddr)) < 0)
+      if (connect(r->m_sb.sb_socket, service, addrlen) < 0)
 	{
 	  int err = GetSockError();
 	  RTMP_Log(RTMP_LOGERROR, "%s, failed to connect socket. %d (%s)",
@@ -1030,23 +1054,22 @@ RTMP_Connect1(RTMP *r, RTMPPacket *cp)
 int
 RTMP_Connect(RTMP *r, RTMPPacket *cp)
 {
-  struct sockaddr_in service;
+  struct sockaddr_storage service;
   if (!r->Link.hostname.av_len)
     return FALSE;
 
-  memset(&service, 0, sizeof(struct sockaddr_in));
-  service.sin_family = AF_INET;
+  memset(&service, 0, sizeof(struct sockaddr_storage));
 
   if (r->Link.socksport)
     {
       /* Connect via SOCKS */
-      if (!add_addr_info(&service, &r->Link.sockshost, r->Link.socksport))
+      if (!add_addr_info(&service, &r->Link.sockshost, r->Link.socksport, NULL))
 	return FALSE;
     }
   else
     {
       /* Connect directly */
-      if (!add_addr_info(&service, &r->Link.hostname, r->Link.port))
+      if (!add_addr_info(&service, &r->Link.hostname, r->Link.port, NULL))
 	return FALSE;
     }
 
@@ -1062,11 +1085,18 @@ static int
 SocksNegotiate(RTMP *r)
 {
   unsigned long addr;
-  struct sockaddr_in service;
-  memset(&service, 0, sizeof(struct sockaddr_in));
+  struct sockaddr_storage service;
+  memset(&service, 0, sizeof(struct sockaddr_storage));
 
-  add_addr_info(&service, &r->Link.hostname, r->Link.port);
-  addr = htonl(service.sin_addr.s_addr);
+  struct addrinfo hints;
+  memset(&hints, 0, sizeof(struct addrinfo));
+  // Only IPv4 is supported by SOCKS4.
+  hints.ai_family = AF_INET;
+
+  if (!add_addr_info(&service, &r->Link.hostname, r->Link.port, &hints))
+    return FALSE;
+
+  addr = htonl(((struct sockaddr_in *)&service)->sin_addr.s_addr);
 
   {
     char packet[] = {
